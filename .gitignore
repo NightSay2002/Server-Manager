@@ -1,0 +1,9 @@
+.state/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+.DS_Store
+
+# Local machine config. Use servers.example.json as the shareable template.
+servers.json
