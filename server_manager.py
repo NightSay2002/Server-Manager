@@ -514,6 +514,13 @@ def ensure_launchd_loaded(service: Service) -> subprocess.CompletedProcess | Non
     plist = infer_launchd_plist(service, raw)
     if not plist:
         return subprocess.CompletedProcess(["launchctl", "bootstrap"], 1, "", f"plist not found for {service.name}")
+    # A disabled label can block bootstrap with launchd error 119. Start/restart
+    # temporarily enables it, then kickstart_launchd_service disables it again
+    # when launchdAutoStart is false.
+    target = launchd_target(service.launchd_label or service.name, service.launchd_domain)
+    enable_result = run_launchctl(["enable", target], service)
+    if enable_result.returncode != 0:
+        return enable_result
     return run_launchctl(["bootstrap", launchd_domain_target(service.launchd_domain), str(plist)], service)
 
 
