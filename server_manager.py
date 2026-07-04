@@ -633,6 +633,24 @@ def parse_launchd_status(raw: str, label: str = LAUNCHD_LABEL) -> dict:
             status["lastTerminatingSignal"] = stripped.split("=", 1)[1].strip()
         elif stripped.startswith("run interval =") and "runInterval" not in status:
             status["runInterval"] = stripped.split("=", 1)[1].strip()
+        elif "com.apple.launchd.calendarinterval" in stripped:
+            status["calendarInterval"] = "configured"
+        elif stripped.startswith('"Hour" =>') and "calendarHour" not in status:
+            status["calendarHour"] = stripped.split("=>", 1)[1].strip()
+        elif stripped.startswith('"Minute" =>') and "calendarMinute" not in status:
+            status["calendarMinute"] = stripped.split("=>", 1)[1].strip()
+        elif stripped.startswith('"Weekday" =>') and "calendarWeekday" not in status:
+            status["calendarWeekday"] = stripped.split("=>", 1)[1].strip()
+    if status.get("calendarInterval"):
+        parts = []
+        if status.get("calendarWeekday"):
+            parts.append(f"weekday {status['calendarWeekday']}")
+        if status.get("calendarHour") is not None and status.get("calendarMinute") is not None:
+            try:
+                parts.append(f"{int(status['calendarHour']):02d}:{int(status['calendarMinute']):02d}")
+            except ValueError:
+                parts.append(f"{status['calendarHour']}:{status['calendarMinute']}")
+        status["calendarInterval"] = ", ".join(parts) if parts else "configured"
     return status
 
 
@@ -652,6 +670,8 @@ def launchd_service_state(service: Service) -> tuple[str, int | None, str]:
     detail_parts = [f"launchd {launchd_state}"]
     if parsed.get("runInterval"):
         detail_parts.append(f"interval {parsed['runInterval']}")
+    if parsed.get("calendarInterval"):
+        detail_parts.append(f"calendar {parsed['calendarInterval']}")
     if parsed.get("lastExitCode"):
         detail_parts.append(f"last exit {parsed['lastExitCode']}")
     if parsed.get("lastTerminatingSignal"):
@@ -661,7 +681,7 @@ def launchd_service_state(service: Service) -> tuple[str, int | None, str]:
 
     if launchd_state == "running":
         return "running", pid, "; ".join(detail_parts)
-    if launchd_state in {"spawn scheduled", "not running"} and parsed.get("runInterval"):
+    if launchd_state in {"spawn scheduled", "not running"} and (parsed.get("runInterval") or parsed.get("calendarInterval")):
         return "scheduled", pid, "; ".join(detail_parts)
     if launchd_state == "spawn scheduled":
         return "scheduled", pid, "; ".join(detail_parts)
