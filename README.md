@@ -151,6 +151,29 @@ SERVER_MANAGER_LAUNCHD_LABEL=com.example.server-manager
 SERVER_MANAGER_WEB_LAUNCHD_LABEL=com.example.server-manager.web
 ```
 
+## Daily Git Push
+
+The optional Python heartbeat job appends one timestamp to
+`daily-push-test.txt`, commits only that file, and pushes the current branch to
+`origin` once per day. Install it at the default time of 05:30:
+
+```bash
+python3 daily_git_push.py install
+```
+
+Choose another local time, run it immediately, inspect it, or remove it:
+
+```bash
+python3 daily_git_push.py install --hour 7 --minute 15
+python3 daily_git_push.py run
+python3 daily_git_push.py status
+python3 daily_git_push.py uninstall
+```
+
+The job never stages other files. If a push is rejected because the remote has
+new commits, it logs the error under `.state/` and leaves conflict resolution
+to you.
+
 ## Local Config
 
 `servers.json` is not committed. To publish or share this project safely, commit

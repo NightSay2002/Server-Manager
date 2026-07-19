@@ -7,3 +7,4 @@ __pycache__/
 
 # Local machine config. Use servers.example.json as the shareable template.
 servers.json
+servers.json.bak*
