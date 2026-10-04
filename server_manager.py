@@ -2,6 +2,7 @@
 import argparse
 import contextlib
 import html
+import ipaddress
 import io
 import json
 import os
@@ -15,7 +16,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
@@ -34,6 +35,7 @@ WEB_LAUNCHD_LABEL = os.environ.get("SERVER_MANAGER_WEB_LAUNCHD_LABEL", "com.loca
 WEB_LAUNCHD_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{WEB_LAUNCHD_LABEL}.plist"
 DEFAULT_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 DEFAULT_SUPERVISE_INTERVAL = 1800
+DEFAULT_SERVICE_HOST = "0.0.0.0"
 DEFAULT_WEB_HOST = "0.0.0.0"
 DEFAULT_WEB_PORT = 8765
 POWER_DAYS = "MTWRFSU"
@@ -46,6 +48,21 @@ POWER_DAY_LABELS = {
     "S": "Sat",
     "U": "Sun",
 }
+POWER_DAY_NAMES = {
+    "monday": "M",
+    "tuesday": "T",
+    "wednesday": "W",
+    "thursday": "R",
+    "friday": "F",
+    "saturday": "S",
+    "sunday": "U",
+}
+POWER_INTERVAL_CONFIG = STATE_DIR / "power-interval.json"
+POWER_INTERVAL_LABEL = os.environ.get(
+    "SERVER_MANAGER_POWER_INTERVAL_LABEL",
+    "com.local.server-manager.power-interval",
+)
+POWER_INTERVAL_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{POWER_INTERVAL_LABEL}.plist"
 STOP_REQUESTED = False
 
 
@@ -90,6 +107,83 @@ class Service:
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def valid_lan_ipv4(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return address.version == 4 and not (address.is_loopback or address.is_link_local or address.is_unspecified)
+
+
+def lan_ip_address() -> str:
+    override = os.environ.get("SERVER_MANAGER_LAN_IP", "").strip()
+    if valid_lan_ipv4(override):
+        return override
+
+    interfaces = []
+    route = shutil.which("route") or "/sbin/route"
+    route_result = subprocess.run(
+        [route, "-n", "get", "default"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    match = re.search(r"^\s*interface:\s*(\S+)", route_result.stdout, re.MULTILINE)
+    if match:
+        interfaces.append(match.group(1))
+    interfaces.extend(interface for interface in ("en0", "en1") if interface not in interfaces)
+
+    ipconfig = shutil.which("ipconfig") or "/usr/sbin/ipconfig"
+    for interface in interfaces:
+        result_obj = subprocess.run(
+            [ipconfig, "getifaddr", interface],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        candidate = result_obj.stdout.strip()
+        if valid_lan_ipv4(candidate):
+            return candidate
+
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("192.0.2.1", 9))
+            candidate = sock.getsockname()[0]
+            if valid_lan_ipv4(candidate):
+                return candidate
+    except OSError:
+        pass
+    return "127.0.0.1"
+
+
+def local_url_host(host: str) -> bool:
+    lowered = host.lower().strip("[]")
+    if lowered in {"localhost", "0.0.0.0", "127.0.0.1", "::", "::1"}:
+        return True
+    try:
+        address = ipaddress.ip_address(lowered)
+    except ValueError:
+        return False
+    return address.is_private or address.is_loopback or address.is_unspecified
+
+
+def url_with_lan_ip(url: str | None, lan_ip: str | None = None) -> str | None:
+    if not url:
+        return url
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname or not local_url_host(parsed.hostname):
+        return url
+    try:
+        port = parsed.port
+    except ValueError:
+        return url
+    host = lan_ip or lan_ip_address()
+    netloc = f"{host}:{port}" if port else host
+    return parsed._replace(netloc=netloc).geturl()
 
 
 def ensure_dirs() -> None:
@@ -159,9 +253,9 @@ def normalize_port(value) -> int | None:
     try:
         port = int(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError("port must be a number") from exc
+        raise ValueError("連接埠必須是數字") from exc
     if port < 1 or port > 65535:
-        raise ValueError("port must be between 1 and 65535")
+        raise ValueError("連接埠必須介於 1 至 65535")
     return port
 
 
@@ -173,7 +267,7 @@ def normalize_ports(value) -> list[int]:
     elif isinstance(value, list):
         raw_values = value
     else:
-        raise ValueError("extraPorts must be a comma-separated string or array")
+        raise ValueError("其他連接埠請用逗號分隔")
     ports = []
     for raw in raw_values:
         port = normalize_port(raw)
@@ -276,7 +370,7 @@ def parse_command_payload(payload: dict, existing: list[str] | None = None) -> l
     elif "commandText" in payload:
         command = payload["commandText"]
     elif existing is not None:
-        return list(existing)
+        command = list(existing)
     else:
         command = ""
 
@@ -286,12 +380,35 @@ def parse_command_payload(payload: dict, existing: list[str] | None = None) -> l
         try:
             parsed = shlex.split(command)
         except ValueError as exc:
-            raise ValueError(f"command parse failed: {exc}") from exc
+            raise ValueError(f"無法解析啟動指令：{exc}") from exc
     else:
-        raise ValueError("command must be a string or array")
+        raise ValueError("啟動指令格式不正確")
     if not parsed:
-        raise ValueError("command is required")
-    return parsed
+        raise ValueError("請填寫啟動指令")
+    return normalize_bind_command(parsed)
+
+
+def normalize_bind_command(command: list[str]) -> list[str]:
+    def wildcard_value(value: str) -> str:
+        if value.startswith(("unix:", "fd:")):
+            return value
+        host, separator, port = value.rpartition(":")
+        if separator and port.isdigit() and host:
+            return f"{DEFAULT_SERVICE_HOST}:{port}"
+        return DEFAULT_SERVICE_HOST
+
+    normalized = list(command)
+    for index, part in enumerate(normalized):
+        if part in {"--host", "--bind"} and index + 1 < len(normalized):
+            normalized[index + 1] = wildcard_value(normalized[index + 1])
+            continue
+        if part.startswith("--host=") or part.startswith("--bind="):
+            flag, value = part.split("=", 1)
+            normalized[index] = f"{flag}={wildcard_value(value)}"
+            continue
+        if re.fullmatch(r"(?:localhost|127\.0\.0\.1|0\.0\.0\.0):\d+", part, re.IGNORECASE):
+            normalized[index] = re.sub(r"^[^:]+", DEFAULT_SERVICE_HOST, part)
+    return normalized
 
 
 def record_event(service_name: str, action: str, message: str = "", pid: int | None = None) -> None:
@@ -763,6 +880,8 @@ def start_service(service: Service) -> dict:
             env["PATH"] = f"{path_part}:{env['PATH']}"
     if service.env:
         env.update(service.env)
+    if service.url:
+        env["HOST"] = DEFAULT_SERVICE_HOST
 
     with service.log_file.open("ab") as log:
         log.write(f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} starting {service.name} ---\n".encode())
@@ -1044,7 +1163,8 @@ def install_web_launchd(host: str = DEFAULT_WEB_HOST, port: int = DEFAULT_WEB_PO
         raise SystemExit(result.returncode)
     subprocess.run(["launchctl", "enable", f"gui/{os.getuid()}/{WEB_LAUNCHD_LABEL}"], check=False)
     print(f"installed web launchd agent: {WEB_LAUNCHD_PLIST}")
-    print(f"web panel will run at login on http://{host if host != '0.0.0.0' else '0.0.0.0'}:{port}")
+    shown_host = lan_ip_address() if host in {"", DEFAULT_WEB_HOST} else host
+    print(f"web panel will run at login on http://{shown_host}:{port}")
 
 
 def uninstall_launchd() -> None:
@@ -1124,7 +1244,11 @@ def display_power_days(days: str) -> str:
 
 def parse_pmset_restart_line(line: str) -> dict:
     parsed = {"enabled": True, "time": "05:00", "timeWithSeconds": "05:00:00", "days": list(POWER_DAYS)}
-    match = re.search(r"restart\s+at\s+(.+?)\s+(every day|on\s+.+)$", line, re.IGNORECASE)
+    match = re.search(
+        r"restart\s+at\s+(\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)\s+(.+)$",
+        line,
+        re.IGNORECASE,
+    )
     if not match:
         return parsed
 
@@ -1138,12 +1262,121 @@ def parse_pmset_restart_line(line: str) -> dict:
         except ValueError:
             pass
 
-    raw_days = match.group(2).strip()
-    if raw_days.lower() != "every day":
-        compact = raw_days.lower().removeprefix("on").strip().upper()
-        days = normalize_power_days(compact)
+    raw_days = match.group(2).strip().lower().removeprefix("on ").strip()
+    if raw_days != "every day":
+        named_days = [POWER_DAY_NAMES[name] for name in POWER_DAY_NAMES if name in raw_days]
+        days = normalize_power_days(named_days or raw_days.upper())
         parsed["days"] = list(days)
     return parsed
+
+
+def load_power_interval_config() -> dict | None:
+    try:
+        data = json.loads(POWER_INTERVAL_CONFIG.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or data.get("mode") != "interval":
+        return None
+    return data
+
+
+def save_power_interval_config(config: dict) -> None:
+    ensure_dirs()
+    POWER_INTERVAL_CONFIG.write_text(
+        json.dumps(config, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def interval_power_target(config: dict) -> datetime:
+    return datetime.fromisoformat(f"{config['nextDate']}T{config['time']}")
+
+
+def advance_power_interval(config: dict, now: datetime | None = None) -> dict:
+    now = now or datetime.now()
+    interval_days = int(config["intervalDays"])
+    target = interval_power_target(config)
+    while target <= now:
+        target += timedelta(days=interval_days)
+    updated = dict(config)
+    updated["nextDate"] = target.date().isoformat()
+    updated["updatedAt"] = now_iso()
+    return updated
+
+
+def build_power_interval_launchd_plist() -> dict:
+    python = sys.executable or shutil.which("python3") or "/usr/bin/python3"
+    return {
+        "Label": POWER_INTERVAL_LABEL,
+        "ProgramArguments": [python, str(ROOT / "server_manager.py"), "power-interval-sync"],
+        "WorkingDirectory": str(ROOT),
+        "RunAtLoad": True,
+        "StartInterval": 1800,
+        "ProcessType": "Background",
+        "StandardOutPath": str(LOG_DIR / "power-interval.out.log"),
+        "StandardErrorPath": str(LOG_DIR / "power-interval.err.log"),
+        "EnvironmentVariables": {"PATH": DEFAULT_PATH},
+    }
+
+
+def install_power_interval_launchd() -> None:
+    ensure_dirs()
+    POWER_INTERVAL_PLIST.parent.mkdir(parents=True, exist_ok=True)
+    with POWER_INTERVAL_PLIST.open("wb") as handle:
+        plistlib.dump(build_power_interval_launchd_plist(), handle)
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(
+        ["launchctl", "bootout", domain, str(POWER_INTERVAL_PLIST)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    result_obj = subprocess.run(
+        ["launchctl", "bootstrap", domain, str(POWER_INTERVAL_PLIST)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result_obj.returncode != 0:
+        output = (result_obj.stderr or result_obj.stdout or "").strip()
+        raise RuntimeError(output or f"launchctl bootstrap failed with code {result_obj.returncode}")
+    subprocess.run(["launchctl", "enable", f"{domain}/{POWER_INTERVAL_LABEL}"], check=False)
+
+
+def remove_power_interval_schedule() -> None:
+    domain = f"gui/{os.getuid()}"
+    subprocess.run(
+        ["launchctl", "bootout", domain, str(POWER_INTERVAL_PLIST)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    POWER_INTERVAL_PLIST.unlink(missing_ok=True)
+    POWER_INTERVAL_CONFIG.unlink(missing_ok=True)
+
+
+def sync_power_interval_schedule() -> dict:
+    config = load_power_interval_config()
+    if not config:
+        raise RuntimeError("power interval schedule is not configured")
+    updated = advance_power_interval(config)
+    if updated != config:
+        save_power_interval_config(updated)
+    target = interval_power_target(updated)
+    weekday = POWER_DAYS[target.weekday()]
+    result_obj = run_pmset_repeat(["restart", weekday, updated["time"]])
+    if result_obj.returncode != 0:
+        output = (result_obj.stderr or result_obj.stdout or "").strip()
+        raise RuntimeError(output or f"pmset repeat restart failed with code {result_obj.returncode}")
+    message = (
+        f"next restart {updated['nextDate']} at {updated['time'][:5]}; "
+        f"every {updated['intervalDays']} days"
+    )
+    print(message)
+    return {**updated, "message": message, "weekday": weekday}
 
 
 def power_schedule_status() -> dict:
@@ -1153,6 +1386,25 @@ def power_schedule_status() -> dict:
     result = subprocess.run([pmset, "-g", "sched"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     raw = result.stdout or result.stderr
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    interval_config = load_power_interval_config()
+    if interval_config:
+        target = interval_power_target(interval_config)
+        return {
+            "summary": (
+                f"restart at {interval_config['time'][:5]} every {interval_config['intervalDays']} days; "
+                f"next {interval_config['nextDate']}"
+            ),
+            "raw": raw,
+            "lines": lines,
+            "enabled": True,
+            "mode": "interval",
+            "time": interval_config["time"][:5],
+            "timeWithSeconds": interval_config["time"],
+            "days": [POWER_DAYS[target.weekday()]],
+            "daySummary": f"every {interval_config['intervalDays']} days",
+            "intervalDays": interval_config["intervalDays"],
+            "nextDate": interval_config["nextDate"],
+        }
     summary = "no repeating restart schedule found"
     structured = {"enabled": False, "time": "05:00", "timeWithSeconds": "05:00:00", "days": list(POWER_DAYS)}
     for line in lines:
@@ -1161,7 +1413,7 @@ def power_schedule_status() -> dict:
             structured = parse_pmset_restart_line(line)
             break
     structured["daySummary"] = display_power_days("".join(structured["days"]))
-    return {"summary": summary, "raw": raw, "lines": lines, **structured}
+    return {"summary": summary, "raw": raw, "lines": lines, "mode": "weekdays", **structured}
 
 
 def run_pmset_repeat(args: list[str]) -> subprocess.CompletedProcess:
@@ -1184,9 +1436,49 @@ def set_power_schedule(payload: dict) -> dict:
         if result_obj.returncode != 0:
             output = (result_obj.stderr or result_obj.stdout or "").strip()
             raise ValueError(output or f"pmset repeat cancel failed with code {result_obj.returncode}")
+        remove_power_interval_schedule()
         return {"ok": True, "message": "system restart schedule disabled", "powerSchedule": power_schedule_status()}
 
     time_value = normalize_power_time(str(payload.get("time", "")).strip())
+    mode = str(payload.get("mode") or "weekdays")
+    if mode == "interval":
+        try:
+            interval_days = int(payload.get("intervalDays", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("interval days must be a number") from exc
+        if interval_days < 1 or interval_days > 365:
+            raise ValueError("interval days must be between 1 and 365")
+        start_date = str(payload.get("startDate") or "").strip()
+        if not start_date:
+            start_date = (datetime.now() + timedelta(days=1)).date().isoformat()
+        try:
+            target = datetime.fromisoformat(f"{start_date}T{time_value}")
+        except ValueError as exc:
+            raise ValueError("start date is invalid") from exc
+        if target <= datetime.now():
+            raise ValueError("first restart must be in the future")
+        config = {
+            "mode": "interval",
+            "intervalDays": interval_days,
+            "time": time_value,
+            "nextDate": start_date,
+            "updatedAt": now_iso(),
+        }
+        save_power_interval_config(config)
+        try:
+            synced = sync_power_interval_schedule()
+            install_power_interval_launchd()
+        except (OSError, RuntimeError) as exc:
+            remove_power_interval_schedule()
+            raise ValueError(f"could not install interval schedule: {exc}") from exc
+        return {
+            "ok": True,
+            "message": synced["message"],
+            "powerSchedule": power_schedule_status(),
+        }
+    if mode != "weekdays":
+        raise ValueError("schedule mode must be weekdays or interval")
+    remove_power_interval_schedule()
     days = normalize_power_days(payload.get("days"))
     result_obj = run_pmset_repeat(["restart", days, time_value])
     if result_obj.returncode != 0:
@@ -1199,7 +1491,7 @@ def set_power_schedule(payload: dict) -> dict:
     }
 
 
-def service_payload(service: Service, event_summary: dict[str, dict[str, str]]) -> dict:
+def service_payload(service: Service, event_summary: dict[str, dict[str, str]], lan_ip: str) -> dict:
     state, pid, detail = service_state(service)
     events = event_summary.get(service.name, {})
     payload = {
@@ -1212,7 +1504,7 @@ def service_payload(service: Service, event_summary: dict[str, dict[str, str]]) 
         "enabled": service.enabled,
         "port": service.port,
         "extraPorts": service.extra_ports or [],
-        "url": service.url,
+        "url": url_with_lan_ip(service.url, lan_ip),
         "state": state,
         "pid": pid,
         "detail": detail,
@@ -1220,6 +1512,7 @@ def service_payload(service: Service, event_summary: dict[str, dict[str, str]]) 
         "launchdLabel": service.launchd_label,
         "launchdDomain": service.launchd_domain,
         "launchdAutoStart": service.launchd_auto_start,
+        "launchdPlist": str(service.launchd_plist) if service.launchd_plist else "",
         "stdoutPath": str(service.stdout_path) if service.stdout_path else "",
         "stderrPath": str(service.stderr_path) if service.stderr_path else "",
         "startWaitSeconds": service.start_wait_seconds,
@@ -1234,8 +1527,11 @@ def status_payload() -> dict:
     services = load_services()
     events = latest_service_events()
     launchd_raw = launchd_status_text()
+    lan_ip = lan_ip_address()
     return {
-        "services": [service_payload(service, events) for service in services.values()],
+        "services": [service_payload(service, events, lan_ip) for service in services.values()],
+        "lanIp": lan_ip,
+        "bindHost": DEFAULT_SERVICE_HOST,
         "powerSchedule": power_schedule_status(),
         "supervisor": parse_launchd_status(launchd_raw),
         "eventLog": str(EVENTS_FILE),
@@ -1243,26 +1539,220 @@ def status_payload() -> dict:
     }
 
 
+def load_launchd_plist(path: Path) -> dict:
+    if not path.is_absolute():
+        raise ValueError("plist 路徑必須是絕對路徑")
+    if not path.is_file():
+        raise ValueError(f"找不到 plist：{path}")
+    try:
+        with path.open("rb") as handle:
+            data = plistlib.load(handle)
+    except (OSError, plistlib.InvalidFileException) as exc:
+        raise ValueError(f"無法讀取 plist：{exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError("plist 內容格式不正確")
+    return data
+
+
+def infer_launchd_domain(path: Path) -> str:
+    if path.parent in {Path("/Library/LaunchDaemons"), Path("/System/Library/LaunchDaemons")}:
+        return "system"
+    return "gui"
+
+
+def launchd_suggestion(plist_raw: str) -> dict:
+    if not plist_raw.strip():
+        raise ValueError("請先填寫 plist 路徑")
+    plist_path = Path(plist_raw).expanduser()
+    data = load_launchd_plist(plist_path)
+    label = str(data.get("Label") or "").strip()
+    if not label:
+        raise ValueError("plist 內沒有 Label")
+
+    arguments = data.get("ProgramArguments")
+    if isinstance(arguments, list):
+        command = [str(part) for part in arguments]
+    elif data.get("Program"):
+        command = [str(data["Program"])]
+    else:
+        command = []
+
+    keep_alive = data.get("KeepAlive", False)
+    return {
+        "detected": True,
+        "kind": "launchd",
+        "name": label.rsplit(".", 1)[-1],
+        "launchdPlist": str(plist_path),
+        "launchdLabel": label,
+        "launchdDomain": infer_launchd_domain(plist_path),
+        "launchdAutoStart": bool(data.get("RunAtLoad", False) or keep_alive),
+        "cwd": str(data.get("WorkingDirectory") or ""),
+        "commandText": shlex.join(command) if command else "",
+        "stdoutPath": str(data.get("StandardOutPath") or ""),
+        "stderrPath": str(data.get("StandardErrorPath") or ""),
+        "reason": f"已讀取 {plist_path.name}",
+    }
+
+
+def process_suggestion(cwd_raw: str) -> dict:
+    if not cwd_raw.strip():
+        raise ValueError("請先填寫專案資料夾")
+    cwd = Path(cwd_raw).expanduser()
+    if not cwd.is_absolute():
+        raise ValueError("專案資料夾必須是絕對路徑")
+    if not cwd.is_dir():
+        raise ValueError(f"找不到專案資料夾：{cwd}")
+
+    suggestion = {
+        "detected": False,
+        "kind": "process",
+        "name": cwd.name,
+        "cwd": str(cwd),
+        "commandText": "",
+        "port": None,
+        "reason": "找不到常見啟動檔，請手動填寫啟動指令",
+    }
+
+    package_path = cwd / "package.json"
+    if package_path.is_file():
+        try:
+            package = json.loads(package_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            package = {}
+        if isinstance(package, dict):
+            package_name = str(package.get("name") or "").strip()
+            if package_name:
+                suggestion["name"] = package_name
+            scripts = package.get("scripts")
+            scripts = scripts if isinstance(scripts, dict) else {}
+            script_name = "start" if scripts.get("start") else "dev" if scripts.get("dev") else ""
+            if script_name:
+                package_manager = "npm"
+                declared_manager = str(package.get("packageManager") or "").split("@", 1)[0]
+                if declared_manager in {"npm", "pnpm", "yarn", "bun"}:
+                    package_manager = declared_manager
+                elif (cwd / "pnpm-lock.yaml").exists():
+                    package_manager = "pnpm"
+                elif (cwd / "yarn.lock").exists():
+                    package_manager = "yarn"
+                elif (cwd / "bun.lock").exists() or (cwd / "bun.lockb").exists():
+                    package_manager = "bun"
+                suggestion.update(
+                    detected=True,
+                    commandText=f"{package_manager} run {script_name}",
+                    reason=f"從 package.json 找到 {script_name} 指令",
+                )
+                return suggestion
+
+    if (cwd / "manage.py").is_file():
+        suggestion.update(
+            detected=True,
+            commandText=f"python3 manage.py runserver {DEFAULT_SERVICE_HOST}:8000",
+            port=8000,
+            reason="偵測到 Django manage.py",
+        )
+        return suggestion
+
+    for filename in ("main.py", "app.py", "server.py"):
+        candidate = cwd / filename
+        if not candidate.is_file():
+            continue
+        try:
+            source_head = candidate.read_text(encoding="utf-8", errors="replace")[:200_000]
+        except OSError:
+            source_head = ""
+        module = candidate.stem
+        if "FastAPI(" in source_head:
+            suggestion.update(
+                detected=True,
+                commandText=f"python3 -m uvicorn {module}:app --host {DEFAULT_SERVICE_HOST} --port 8000",
+                port=8000,
+                reason=f"偵測到 {filename} 的 FastAPI app",
+            )
+        else:
+            suggestion.update(
+                detected=True,
+                commandText=f"python3 {filename}",
+                reason=f"偵測到 {filename}",
+            )
+        return suggestion
+
+    if (cwd / "start.sh").is_file():
+        suggestion.update(
+            detected=True,
+            commandText="./start.sh",
+            reason="偵測到 start.sh",
+        )
+        return suggestion
+
+    compose_name = next(
+        (name for name in ("compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml") if (cwd / name).is_file()),
+        "",
+    )
+    if compose_name:
+        suggestion.update(
+            detected=True,
+            commandText="docker compose up",
+            reason=f"偵測到 {compose_name}",
+        )
+    return suggestion
+
+
+def service_suggestion(payload: dict) -> dict:
+    kind = str(payload.get("kind") or "process")
+    if kind == "process":
+        return process_suggestion(str(payload.get("cwd") or ""))
+    if kind == "launchd":
+        return launchd_suggestion(str(payload.get("launchdPlist") or ""))
+    raise ValueError("不支援的服務類型")
+
+
 def validate_service_payload(payload: dict, services: dict[str, Service], existing: Service | None = None) -> Service:
     kind = payload.get("kind", existing.kind if existing else "process")
     if kind not in {"process", "launchd"}:
-        raise ValueError("kind must be process or launchd")
+        raise ValueError("不支援的服務類型")
 
     if kind == "launchd":
-        label = payload.get("launchdLabel", existing.launchd_label if existing else "")
+        plist_value = payload.get(
+            "launchdPlist",
+            str(existing.launchd_plist) if existing and existing.launchd_plist else "",
+        )
+        launchd_plist = Path(str(plist_value)).expanduser() if plist_value else None
+        plist_data = load_launchd_plist(launchd_plist) if launchd_plist else {}
+        label = payload.get("launchdLabel") or plist_data.get("Label") or (existing.launchd_label if existing else "")
         if not label:
-            raise ValueError("launchdLabel is required for launchd services")
-        raw_name = payload.get("name") or (existing.name if existing else label)
+            raise ValueError("請填寫 plist 路徑或 Launchd Label")
+        raw_name = payload.get("name") or (existing.name if existing else str(label).rsplit(".", 1)[-1])
         name = unique_service_name(str(raw_name), services, original=existing.name if existing else None)
         url = payload.get("url", existing.url if existing else None)
         if url == "":
             url = None
-        cwd_raw = payload.get("cwd", str(existing.cwd) if existing and existing.cwd else "")
+        url = url_with_lan_ip(url)
+        cwd_raw = (
+            payload.get("cwd")
+            or plist_data.get("WorkingDirectory")
+            or (str(existing.cwd) if existing and existing.cwd else "")
+        )
         cwd = Path(str(cwd_raw)).expanduser() if cwd_raw else None
         if cwd and (not cwd.is_absolute() or not cwd.exists()):
-            raise ValueError(f"cwd does not exist or is not absolute: {cwd}")
+            raise ValueError(f"工作資料夾不存在或不是絕對路徑：{cwd}")
         created_at = existing.created_at if existing and existing.created_at else now_iso()
-        start_wait_seconds = int(payload.get("startWaitSeconds", existing.start_wait_seconds if existing else 2) or 0)
+        start_wait_seconds = int(payload.get("startWaitSeconds", existing.start_wait_seconds if existing else 15) or 0)
+        domain = (
+            payload.get("launchdDomain")
+            or (infer_launchd_domain(launchd_plist) if launchd_plist else None)
+            or (existing.launchd_domain if existing else "gui")
+        )
+        if domain not in {"gui", "system"} and "/" not in str(domain):
+            raise ValueError("Launchd Domain 必須是 gui 或 system")
+        stdout_value = payload.get("stdoutPath") or plist_data.get("StandardOutPath")
+        stderr_value = payload.get("stderrPath") or plist_data.get("StandardErrorPath")
+        if "launchdAutoStart" in payload:
+            launchd_auto_start = bool(payload["launchdAutoStart"])
+        elif existing:
+            launchd_auto_start = existing.launchd_auto_start
+        else:
+            launchd_auto_start = bool(plist_data.get("RunAtLoad") or plist_data.get("KeepAlive"))
         return Service(
             name=name,
             description=str(payload.get("description", existing.description if existing else "") or ""),
@@ -1273,11 +1763,11 @@ def validate_service_payload(payload: dict, services: dict[str, Service], existi
             extra_ports=normalize_ports(payload.get("extraPorts", existing.extra_ports if existing else [])),
             url=url,
             launchd_label=str(label),
-            launchd_domain=str(payload.get("launchdDomain", existing.launchd_domain if existing and existing.launchd_domain else "gui") or "gui"),
-            launchd_auto_start=bool(payload.get("launchdAutoStart", existing.launchd_auto_start if existing else True)),
-            launchd_plist=Path(payload["launchdPlist"]).expanduser() if payload.get("launchdPlist") else (existing.launchd_plist if existing else None),
-            stdout_path=Path(payload["stdoutPath"]).expanduser() if payload.get("stdoutPath") else (existing.stdout_path if existing else None),
-            stderr_path=Path(payload["stderrPath"]).expanduser() if payload.get("stderrPath") else (existing.stderr_path if existing else None),
+            launchd_domain=str(domain),
+            launchd_auto_start=launchd_auto_start,
+            launchd_plist=launchd_plist,
+            stdout_path=Path(str(stdout_value)).expanduser() if stdout_value else (existing.stdout_path if existing else None),
+            stderr_path=Path(str(stderr_value)).expanduser() if stderr_value else (existing.stderr_path if existing else None),
             start_wait_seconds=max(0, start_wait_seconds),
             enabled=bool(payload.get("enabled", existing.enabled if existing else True)),
             created_at=created_at,
@@ -1308,20 +1798,22 @@ def validate_service_payload(payload: dict, services: dict[str, Service], existi
         start_wait_seconds = int(payload.get("startWaitSeconds", 2) or 0)
 
     if not cwd_raw:
-        raise ValueError("cwd is required")
+        raise ValueError("請填寫專案資料夾")
     cwd = Path(str(cwd_raw)).expanduser()
     if not cwd.is_absolute():
-        raise ValueError("cwd must be an absolute path")
+        raise ValueError("專案資料夾必須是絕對路徑")
     if not cwd.exists():
-        raise ValueError(f"cwd does not exist: {cwd}")
+        raise ValueError(f"找不到專案資料夾：{cwd}")
     if url == "":
         url = None
+    url = url_with_lan_ip(url)
     return Service(
         name=name,
         description=str(description or ""),
         cwd=cwd,
         command=command,
         port=port,
+        extra_ports=normalize_ports(payload.get("extraPorts", existing.extra_ports if existing else [])),
         url=url,
         env=existing.env if existing else None,
         start_wait_seconds=max(0, start_wait_seconds),
@@ -1400,14 +1892,27 @@ INDEX_HTML = """<!doctype html>
       <form id="powerForm" class="power-form">
         <label class="checkline"><input id="powerEnabled" type="checkbox"> Enabled</label>
         <label>Time<input id="powerTime" type="time" step="60"></label>
-        <div class="weekday-row" id="powerDays">
-          <label class="checkline"><input type="checkbox" value="M"> Mon</label>
-          <label class="checkline"><input type="checkbox" value="T"> Tue</label>
-          <label class="checkline"><input type="checkbox" value="W"> Wed</label>
-          <label class="checkline"><input type="checkbox" value="R"> Thu</label>
-          <label class="checkline"><input type="checkbox" value="F"> Fri</label>
-          <label class="checkline"><input type="checkbox" value="S"> Sat</label>
-          <label class="checkline"><input type="checkbox" value="U"> Sun</label>
+        <label>Schedule
+          <select id="powerMode">
+            <option value="weekdays">Weekdays</option>
+            <option value="interval">Every N days</option>
+          </select>
+        </label>
+        <div id="powerWeekdayFields" class="power-mode-fields">
+          <span class="muted">Days</span>
+          <div class="weekday-row" id="powerDays">
+            <label class="checkline"><input type="checkbox" value="M"> Mon</label>
+            <label class="checkline"><input type="checkbox" value="T"> Tue</label>
+            <label class="checkline"><input type="checkbox" value="W"> Wed</label>
+            <label class="checkline"><input type="checkbox" value="R"> Thu</label>
+            <label class="checkline"><input type="checkbox" value="F"> Fri</label>
+            <label class="checkline"><input type="checkbox" value="S"> Sat</label>
+            <label class="checkline"><input type="checkbox" value="U"> Sun</label>
+          </div>
+        </div>
+        <div id="powerIntervalFields" class="power-mode-fields interval-fields" hidden>
+          <label>Interval days<input id="powerIntervalDays" type="number" min="1" max="365" value="3"></label>
+          <label>First restart<input id="powerStartDate" type="date"></label>
         </div>
         <div id="powerRaw" class="muted"></div>
       </form>
@@ -1416,35 +1921,127 @@ INDEX_HTML = """<!doctype html>
       <div>
         <section class="panel">
           <div class="panel-head">
-            <h2 id="formTitle">新增 server</h2>
-            <button id="resetFormBtn" type="button" class="ghost">Clear</button>
+            <div>
+              <h2 id="formTitle">新增服務</h2>
+              <p id="formModeHint" class="muted">選擇類型後，只需填寫基本資料。</p>
+            </div>
+            <button id="resetFormBtn" type="button" class="ghost">重新填寫</button>
           </div>
           <form id="serviceForm" class="service-form">
             <input type="hidden" id="originalName">
-            <label>Kind
-              <select id="kind" name="kind">
-                <option value="process">Process / Python watcher</option>
-                <option value="launchd">Launchd service</option>
-              </select>
-            </label>
-            <label>Name<input id="name" name="name" autocomplete="off" required></label>
-            <label>CWD<input id="cwd" name="cwd" placeholder="/absolute/path" required></label>
-            <label>Command<input id="commandText" name="commandText" placeholder="npm run start" required></label>
-            <div class="form-row">
-              <label>Port<input id="port" name="port" inputmode="numeric"></label>
-              <label>URL<input id="url" name="url" placeholder="http://127.0.0.1:8000"></label>
+
+            <fieldset class="form-block kind-block">
+              <legend>服務類型</legend>
+              <div class="segmented" role="radiogroup" aria-label="服務類型">
+                <label>
+                  <input type="radio" name="kind" value="process" checked>
+                  <span>一般程式或網站</span>
+                </label>
+                <label>
+                  <input type="radio" name="kind" value="launchd">
+                  <span>macOS 背景服務</span>
+                </label>
+              </div>
+            </fieldset>
+
+            <section class="form-section" data-kind-section="process">
+              <h3>啟動資料</h3>
+              <label class="field"><span class="field-label">專案資料夾 <span class="required">必填</span></span>
+                <div class="field-with-action">
+                  <input id="processCwd" name="processCwd" placeholder="/Users/你的名稱/Documents/my-server" autocomplete="off">
+                  <button id="detectProcessBtn" type="button" class="ghost">自動偵測</button>
+                </div>
+              </label>
+              <label class="field"><span class="field-label">啟動指令 <span class="required">必填</span></span>
+                <input id="commandText" name="commandText" placeholder="例如 npm run start 或 python3 main.py" autocomplete="off">
+              </label>
+              <div id="processDetectionStatus" class="detection-status" hidden></div>
+            </section>
+
+            <section class="form-section" data-kind-section="launchd" hidden>
+              <h3>Launchd 設定</h3>
+              <label class="field"><span class="field-label">plist 檔案路徑 <span class="required">必填</span></span>
+                <div class="field-with-action">
+                  <input id="launchdPlist" name="launchdPlist" placeholder="/Users/你的名稱/Library/LaunchAgents/com.example.service.plist" autocomplete="off">
+                  <button id="detectLaunchdBtn" type="button" class="ghost">讀取設定</button>
+                </div>
+              </label>
+              <div id="launchdDetectionStatus" class="detection-status" hidden></div>
+            </section>
+
+            <section class="form-section">
+              <h3>顯示資料</h3>
+              <label class="field">服務名稱
+                <input id="name" name="name" autocomplete="off" placeholder="留空會自動命名">
+              </label>
+              <label class="field">備註
+                <input id="description" name="description" placeholder="例如：公司網站 API">
+              </label>
+            </section>
+
+            <details id="advancedSettings" class="advanced-settings">
+              <summary>進階設定</summary>
+              <div class="advanced-body">
+                <div class="form-row">
+                  <label>主要連接埠
+                    <input id="port" name="port" inputmode="numeric" min="1" max="65535" placeholder="例如 8000">
+                  </label>
+                  <label>啟動等待秒數
+                    <input id="startWaitSeconds" name="startWaitSeconds" type="number" min="0" max="300" step="1" value="15">
+                  </label>
+                </div>
+                <label>服務網址
+                  <input id="url" name="url" placeholder="http://192.168.x.x:8000">
+                </label>
+                <label>其他連接埠
+                  <input id="extraPorts" name="extraPorts" placeholder="例如 8080, 18110">
+                </label>
+
+                <div data-kind-advanced="launchd" hidden>
+                  <div class="form-row">
+                    <label>Launchd Label
+                      <input id="launchdLabel" name="launchdLabel" placeholder="讀取 plist 後自動填寫">
+                    </label>
+                    <label>執行範圍
+                      <select id="launchdDomain" name="launchdDomain">
+                        <option value="">自動判斷</option>
+                        <option value="gui">目前使用者</option>
+                        <option value="system">整部電腦</option>
+                      </select>
+                    </label>
+                  </div>
+                  <label>工作資料夾
+                    <input id="launchdCwd" name="launchdCwd" placeholder="通常由 plist 自動填寫">
+                  </label>
+                  <label>標準輸出日誌
+                    <input id="stdoutPath" name="stdoutPath" placeholder="/tmp/service.out.log">
+                  </label>
+                  <label>錯誤日誌
+                    <input id="stderrPath" name="stderrPath" placeholder="/tmp/service.err.log">
+                  </label>
+                  <label class="checkline">
+                    <input id="launchdAutoStart" name="launchdAutoStart" type="checkbox">
+                    讓 launchd 自行在登入或開機時啟動
+                  </label>
+                </div>
+              </div>
+            </details>
+
+            <div class="toggle-stack">
+              <label class="checkline">
+                <input id="enabled" name="enabled" type="checkbox" checked>
+                交給 Project Server 持續監管
+              </label>
+              <label class="checkline">
+                <input id="startAfterSave" name="startAfterSave" type="checkbox" checked>
+                儲存後立即啟動
+              </label>
             </div>
-            <label>Launchd Label<input id="launchdLabel" name="launchdLabel" placeholder="com.example.service"></label>
-            <div class="form-row">
-              <label>Domain<input id="launchdDomain" name="launchdDomain" placeholder="gui or system"></label>
-              <label>Extra ports<input id="extraPorts" name="extraPorts" placeholder="8080, 18110"></label>
+            <div id="formError" class="inline-error" role="alert" hidden></div>
+            <div class="form-actions">
+              <button id="saveServiceBtn" type="submit">新增並啟動</button>
+              <button id="cancelEditBtn" type="button" class="ghost" hidden>取消編輯</button>
             </div>
-            <label>stdout log<input id="stdoutPath" name="stdoutPath" placeholder="/tmp/service.out.log"></label>
-            <label>stderr log<input id="stderrPath" name="stderrPath" placeholder="/tmp/service.err.log"></label>
-            <label>Description<input id="description" name="description"></label>
-            <label class="checkline"><input id="launchdAutoStart" name="launchdAutoStart" type="checkbox" checked> Native launchd auto-start</label>
-            <label class="checkline"><input id="enabled" name="enabled" type="checkbox" checked> Enabled</label>
-            <button type="submit">Save</button>
           </form>
         </section>
         <section class="panel">
@@ -1512,6 +2109,7 @@ button {
   cursor: pointer;
 }
 button:hover { filter: brightness(0.96); }
+button:disabled { cursor: wait; opacity: .58; }
 button.ghost {
   background: #fff;
   color: var(--accent);
@@ -1530,6 +2128,10 @@ input, select {
   padding: 7px 9px;
   font: inherit;
   background: white;
+}
+input:focus, select:focus {
+  border-color: var(--accent);
+  outline: 3px solid rgba(20, 108, 148, .12);
 }
 label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
 .topbar, .panel-head {
@@ -1556,12 +2158,138 @@ label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
 .metric strong { font-size: 16px; line-height: 1.35; overflow-wrap: anywhere; }
 .layout {
   display: grid;
-  grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
+  grid-template-columns: minmax(380px, 500px) minmax(0, 1fr);
   gap: 16px;
   align-items: start;
 }
 .panel { padding: 14px; margin-bottom: 16px; }
-.service-form { display: grid; gap: 10px; }
+.service-form { display: grid; gap: 14px; }
+.form-block {
+  border: 0;
+  margin: 0;
+  padding: 0;
+}
+.form-block legend {
+  margin-bottom: 7px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.segmented {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+.segmented label {
+  display: block;
+  position: relative;
+  color: var(--ink);
+  font-size: 13px;
+}
+.segmented label + label { border-left: 1px solid var(--line); }
+.segmented input {
+  position: absolute;
+  width: 1px;
+  min-height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+.segmented span {
+  display: grid;
+  place-items: center;
+  min-height: 40px;
+  padding: 7px 10px;
+  text-align: center;
+  cursor: pointer;
+}
+.segmented input:checked + span {
+  background: #e8f3f7;
+  color: #0c5e7d;
+  font-weight: 650;
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.segmented input:focus-visible + span {
+  outline: 3px solid rgba(20, 108, 148, .18);
+  outline-offset: -3px;
+}
+.form-section {
+  display: grid;
+  gap: 10px;
+  padding-top: 13px;
+  border-top: 1px solid var(--line);
+}
+.form-section h3 {
+  color: var(--ink);
+  font-size: 13px;
+}
+.field-label { color: var(--muted); }
+.required {
+  color: var(--bad);
+  font-size: 11px;
+  margin-left: 4px;
+}
+.field-with-action {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 92px;
+  gap: 8px;
+}
+.field-with-action button {
+  width: 92px;
+  padding: 0 8px;
+}
+.detection-status {
+  border-left: 3px solid var(--ok);
+  padding: 7px 9px;
+  background: #edf8f3;
+  color: #155f43;
+  font-size: 12px;
+  line-height: 1.45;
+}
+.detection-status.error {
+  border-left-color: var(--bad);
+  background: #fff1f1;
+  color: var(--bad);
+}
+.detection-status.notice {
+  border-left-color: var(--warn);
+  background: #fff7e7;
+  color: #7a4d00;
+}
+.advanced-settings {
+  border-top: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+.advanced-settings summary {
+  cursor: pointer;
+  padding: 11px 2px;
+  color: var(--accent);
+  font-weight: 650;
+}
+.advanced-body {
+  display: grid;
+  gap: 10px;
+  padding: 2px 0 13px;
+}
+.toggle-stack {
+  display: grid;
+  gap: 9px;
+}
+.form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.form-actions button { min-width: 120px; }
+.inline-error {
+  border: 1px solid #e3a1a1;
+  border-radius: 6px;
+  padding: 9px 10px;
+  background: #fff1f1;
+  color: var(--bad);
+  line-height: 1.45;
+}
+[hidden] { display: none !important; }
 .power-form {
   display: grid;
   grid-template-columns: 120px 140px minmax(0, 1fr);
@@ -1572,13 +2300,22 @@ label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
   grid-column: 1 / -1;
   overflow-wrap: anywhere;
 }
+.power-mode-fields {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 16px;
+  align-items: end;
+}
+.power-mode-fields > .muted { min-width: 44px; }
+.interval-fields label { min-width: 180px; }
 .weekday-row {
   display: flex;
   flex-wrap: wrap;
   gap: 10px 12px;
   align-items: center;
 }
-.form-row { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 10px; }
+.form-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
 .checkline {
   display: flex;
   align-items: center;
@@ -1649,7 +2386,10 @@ label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
   .layout { grid-template-columns: 1fr; }
 }
 @media (max-width: 560px) {
-  .summary, .power-form, .form-row, .details { grid-template-columns: 1fr; }
+  .summary, .power-form, .form-row, .details, .segmented, .field-with-action { grid-template-columns: 1fr; }
+  .segmented label + label { border-left: 0; border-top: 1px solid var(--line); }
+  .field-with-action button { width: 100%; }
+  .form-actions button { flex: 1 1 140px; }
   .topbar { align-items: flex-start; }
 }
 """
@@ -1659,6 +2399,7 @@ APP_JS = r"""
 const $ = (id) => document.getElementById(id);
 let current = null;
 let selectedLog = "";
+let suggestedName = "";
 
 function esc(value) {
   return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
@@ -1717,11 +2458,15 @@ function renderPowerSchedule() {
   const power = current.powerSchedule || {};
   $("powerEnabled").checked = !!power.enabled;
   $("powerTime").value = power.time || "05:00";
+  $("powerMode").value = power.mode || "weekdays";
+  $("powerIntervalDays").value = power.intervalDays || 3;
+  $("powerStartDate").value = power.nextDate || "";
   const days = new Set(power.days || ["M", "T", "W", "R", "F", "S", "U"]);
   document.querySelectorAll("#powerDays input").forEach((input) => {
     input.checked = days.has(input.value);
   });
   $("powerRaw").textContent = power.summary || "";
+  updatePowerMode();
 }
 
 function card(service) {
@@ -1784,65 +2529,182 @@ function render() {
   renderSummary();
   renderPowerSchedule();
   renderServices();
+  $("url").placeholder = `http://${current.lanIp || "192.168.x.x"}:8000`;
 }
 
 function powerPayload() {
+  const mode = $("powerMode").value;
   const days = Array.from(document.querySelectorAll("#powerDays input:checked")).map((input) => input.value);
-  if ($("powerEnabled").checked && days.length === 0) {
+  if ($("powerEnabled").checked && mode === "weekdays" && days.length === 0) {
     throw new Error("Choose at least one restart day.");
   }
   return {
     enabled: $("powerEnabled").checked,
     time: $("powerTime").value,
+    mode,
     days,
+    intervalDays: $("powerIntervalDays").value,
+    startDate: $("powerStartDate").value,
   };
 }
 
+function updatePowerMode() {
+  const interval = $("powerMode").value === "interval";
+  $("powerWeekdayFields").hidden = interval;
+  $("powerIntervalFields").hidden = !interval;
+}
+
 function formPayload() {
+  const kind = selectedKind();
   return {
-    kind: $("kind").value,
+    kind,
     name: $("name").value.trim(),
-    cwd: $("cwd").value.trim(),
+    cwd: (kind === "launchd" ? $("launchdCwd").value : $("processCwd").value).trim(),
     commandText: $("commandText").value.trim(),
     port: $("port").value.trim(),
     launchdLabel: $("launchdLabel").value.trim(),
     launchdDomain: $("launchdDomain").value.trim(),
     launchdAutoStart: $("launchdAutoStart").checked,
+    launchdPlist: $("launchdPlist").value.trim(),
     extraPorts: $("extraPorts").value.trim(),
     stdoutPath: $("stdoutPath").value.trim(),
     stderrPath: $("stderrPath").value.trim(),
+    startWaitSeconds: $("startWaitSeconds").value.trim(),
     url: $("url").value.trim(),
     description: $("description").value.trim(),
     enabled: $("enabled").checked,
   };
 }
 
-function updateKindRequirements() {
-  const isLaunchd = $("kind").value === "launchd";
-  $("cwd").required = !isLaunchd;
+function selectedKind() {
+  return document.querySelector('input[name="kind"]:checked')?.value || "process";
+}
+
+function selectKind(kind) {
+  const input = document.querySelector(`input[name="kind"][value="${kind}"]`);
+  if (input) input.checked = true;
+  updateKindUI();
+}
+
+function updateSaveButton() {
+  const editing = !!$("originalName").value;
+  const startsNow = $("enabled").checked && $("startAfterSave").checked;
+  $("saveServiceBtn").textContent = editing
+    ? (startsNow ? "儲存並重新啟動" : "儲存變更")
+    : (startsNow ? "新增並啟動" : "儲存設定");
+}
+
+function updateKindUI() {
+  const kind = selectedKind();
+  const isLaunchd = kind === "launchd";
+  document.querySelectorAll("[data-kind-section]").forEach((section) => {
+    section.hidden = section.dataset.kindSection !== kind;
+  });
+  document.querySelectorAll("[data-kind-advanced]").forEach((section) => {
+    section.hidden = section.dataset.kindAdvanced !== kind;
+  });
+  $("processCwd").required = !isLaunchd;
   $("commandText").required = !isLaunchd;
-  $("launchdLabel").required = isLaunchd;
+  $("launchdPlist").required = isLaunchd;
+  $("formModeHint").textContent = isLaunchd
+    ? "填入 plist 路徑，其餘設定可自動讀取。"
+    : "填入專案資料夾，可自動尋找常見啟動指令。";
+  updateSaveButton();
+}
+
+function setDetectionStatus(id, message, tone = "success") {
+  const box = $(id);
+  box.textContent = message;
+  box.classList.toggle("error", tone === "error");
+  box.classList.toggle("notice", tone === "notice");
+  box.hidden = !message;
+}
+
+function showFormError(message = "") {
+  $("formError").textContent = message;
+  $("formError").hidden = !message;
+}
+
+function applySuggestion(data) {
+  const currentName = $("name").value.trim();
+  if (data.name && (!currentName || currentName === suggestedName)) {
+    $("name").value = data.name;
+    suggestedName = data.name;
+  }
+  if (data.kind === "process") {
+    if (data.cwd) $("processCwd").value = data.cwd;
+    if (data.commandText) $("commandText").value = data.commandText;
+    if (data.port && !$("port").value) $("port").value = data.port;
+    if (data.port && !$("url").value) $("url").value = `http://${current.lanIp || location.hostname}:${data.port}`;
+    setDetectionStatus(
+      "processDetectionStatus",
+      data.reason,
+      data.detected ? "success" : "notice",
+    );
+    return;
+  }
+  $("launchdPlist").value = data.launchdPlist || $("launchdPlist").value;
+  $("launchdLabel").value = data.launchdLabel || "";
+  $("launchdDomain").value = data.launchdDomain || "";
+  $("launchdCwd").value = data.cwd || "";
+  $("stdoutPath").value = data.stdoutPath || "";
+  $("stderrPath").value = data.stderrPath || "";
+  $("launchdAutoStart").checked = !!data.launchdAutoStart;
+  setDetectionStatus(
+    "launchdDetectionStatus",
+    `${data.reason} · ${data.launchdDomain}/${data.launchdLabel}`,
+  );
+}
+
+async function detectService(kind, button) {
+  const statusId = kind === "launchd" ? "launchdDetectionStatus" : "processDetectionStatus";
+  setDetectionStatus(statusId, "正在讀取設定...", "notice");
+  button.disabled = true;
+  try {
+    const body = kind === "launchd"
+      ? { kind, launchdPlist: $("launchdPlist").value.trim() }
+      : { kind, cwd: $("processCwd").value.trim() };
+    const suggestion = await api("/api/service-suggestions", { method: "POST", body });
+    applySuggestion(suggestion);
+    showFormError();
+  } catch (error) {
+    setDetectionStatus(statusId, error.message, "error");
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function resetForm() {
   $("originalName").value = "";
-  $("formTitle").textContent = "新增 server";
+  suggestedName = "";
+  $("formTitle").textContent = "新增服務";
   $("serviceForm").reset();
-  $("kind").value = "process";
-  updateKindRequirements();
-  $("launchdAutoStart").checked = true;
+  $("startWaitSeconds").value = "15";
+  $("launchdAutoStart").checked = false;
   $("enabled").checked = true;
+  $("startAfterSave").checked = true;
+  $("startAfterSave").disabled = false;
+  $("advancedSettings").open = false;
+  $("cancelEditBtn").hidden = true;
+  setDetectionStatus("processDetectionStatus", "");
+  setDetectionStatus("launchdDetectionStatus", "");
+  showFormError();
+  selectKind("process");
+  updateSaveButton();
 }
 
 function editService(service) {
+  resetForm();
   $("originalName").value = service.name;
   $("formTitle").textContent = `編輯 ${service.name}`;
-  $("kind").value = service.kind || "process";
-  updateKindRequirements();
+  selectKind(service.kind || "process");
   $("name").value = service.name;
-  $("cwd").value = service.cwd;
+  $("processCwd").value = service.cwd || "";
+  $("launchdCwd").value = service.cwd || "";
   $("commandText").value = service.commandText;
   $("port").value = service.port || "";
+  $("startWaitSeconds").value = service.startWaitSeconds ?? 15;
+  $("launchdPlist").value = service.launchdPlist || "";
   $("launchdLabel").value = service.launchdLabel || "";
   $("launchdDomain").value = service.launchdDomain || "";
   $("launchdAutoStart").checked = service.launchdAutoStart !== false;
@@ -1852,6 +2714,10 @@ function editService(service) {
   $("url").value = service.url || "";
   $("description").value = service.description || "";
   $("enabled").checked = !!service.enabled;
+  $("startAfterSave").checked = false;
+  $("startAfterSave").disabled = !service.enabled;
+  $("cancelEditBtn").hidden = false;
+  updateSaveButton();
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
@@ -1914,15 +2780,35 @@ $("serviceForm").addEventListener("submit", async (event) => {
   event.preventDefault();
   const original = $("originalName").value;
   const payload = formPayload();
+  const saveButton = $("saveServiceBtn");
+  saveButton.disabled = true;
+  showFormError();
   try {
     const response = original
       ? await api(`/api/services/${encodeURIComponent(original)}`, { method: "PATCH", body: payload })
       : await api("/api/services", { method: "POST", body: payload });
-    toast(response.message || "Saved");
+
+    const savedName = response.service?.name || payload.name || original;
+    if (payload.enabled && $("startAfterSave").checked && savedName) {
+      try {
+        const action = original ? "restart" : "start";
+        const started = await api(`/api/services/${encodeURIComponent(savedName)}/${action}`, { method: "POST" });
+        toast(started.message || (original ? `已重新啟動 ${savedName}` : `已啟動 ${savedName}`));
+      } catch (error) {
+        showFormError(`設定已儲存，但啟動失敗：${error.message}`);
+        await refresh();
+        return;
+      }
+    } else {
+      toast(response.message || "已儲存");
+    }
     resetForm();
     await refresh();
   } catch (error) {
+    showFormError(error.message);
     toast(error.message);
+  } finally {
+    saveButton.disabled = false;
   }
 });
 
@@ -1942,9 +2828,21 @@ $("powerForm").addEventListener("submit", async (event) => {
 
 $("refreshBtn").addEventListener("click", () => refresh().catch((error) => toast(error.message)));
 $("refreshLogBtn").addEventListener("click", () => refreshLog().catch((error) => toast(error.message)));
+$("powerMode").addEventListener("change", updatePowerMode);
 $("resetFormBtn").addEventListener("click", resetForm);
-$("kind").addEventListener("change", updateKindRequirements);
-updateKindRequirements();
+$("cancelEditBtn").addEventListener("click", resetForm);
+$("detectProcessBtn").addEventListener("click", (event) => detectService("process", event.currentTarget));
+$("detectLaunchdBtn").addEventListener("click", (event) => detectService("launchd", event.currentTarget));
+document.querySelectorAll('input[name="kind"]').forEach((input) => {
+  input.addEventListener("change", updateKindUI);
+});
+$("enabled").addEventListener("change", () => {
+  if (!$("enabled").checked) $("startAfterSave").checked = false;
+  $("startAfterSave").disabled = !$("enabled").checked;
+  updateSaveButton();
+});
+$("startAfterSave").addEventListener("change", updateSaveButton);
+resetForm();
 refresh().catch((error) => toast(error.message));
 """
 
@@ -1978,7 +2876,9 @@ class ServerManagerHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         try:
-            if path == "/api/services":
+            if path == "/api/service-suggestions":
+                self.handle_service_suggestion()
+            elif path == "/api/services":
                 self.handle_create_service()
             elif path == "/api/power-schedule":
                 self.handle_power_schedule()
@@ -2016,6 +2916,10 @@ class ServerManagerHandler(BaseHTTPRequestHandler):
     def handle_power_schedule(self) -> None:
         payload = read_json_body(self)
         send_json(self, set_power_schedule(payload))
+
+    def handle_service_suggestion(self) -> None:
+        payload = read_json_body(self)
+        send_json(self, service_suggestion(payload))
 
     def service_name_from_path(self, path: str, suffix: str = "") -> str:
         prefix = "/api/services/"
@@ -2123,12 +3027,12 @@ class ServerManagerHandler(BaseHTTPRequestHandler):
         send_json(self, {"ok": True, "service": name, "logPath": str(service.log_file), "text": tail_log_text(service, lines)})
 
 
-def run_web(port: int, host: str = "127.0.0.1") -> None:
+def run_web(port: int, host: str = DEFAULT_WEB_HOST) -> None:
     ensure_dirs()
     server = ThreadingHTTPServer((host, port), ServerManagerHandler)
-    shown_host = "127.0.0.1" if host in {"", "0.0.0.0"} else host
+    shown_host = lan_ip_address() if host in {"", DEFAULT_WEB_HOST} else host
     print(f"web panel listening on http://{shown_host}:{port}")
-    if host == "0.0.0.0":
+    if host == DEFAULT_WEB_HOST:
         print(f"LAN access enabled on port {port}; use this only on a trusted network")
     try:
         server.serve_forever()
@@ -2160,7 +3064,7 @@ def main() -> int:
 
     web = subparsers.add_parser("web")
     web.add_argument("--port", type=int, default=8765)
-    web.add_argument("--host", default="127.0.0.1", help="bind host; use 0.0.0.0 for LAN access")
+    web.add_argument("--host", default=DEFAULT_WEB_HOST, help="bind host; defaults to 0.0.0.0 for LAN access")
 
     subparsers.add_parser("install-launchd")
     subparsers.add_parser("uninstall-launchd")
@@ -2172,6 +3076,7 @@ def main() -> int:
 
     subparsers.add_parser("uninstall-web-launchd")
     subparsers.add_parser("web-launchd-status")
+    subparsers.add_parser("power-interval-sync")
 
     args = parser.parse_args()
 
@@ -2192,6 +3097,9 @@ def main() -> int:
         return 0
     if args.command == "web-launchd-status":
         web_launchd_status()
+        return 0
+    if args.command == "power-interval-sync":
+        sync_power_interval_schedule()
         return 0
     if args.command == "web":
         run_web(args.port, args.host)

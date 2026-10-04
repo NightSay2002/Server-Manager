@@ -15,8 +15,13 @@ cd Server-Manager
 Open:
 
 ```text
-http://127.0.0.1:8765
+http://<LAN-IP>:8765
 ```
+
+The web panel and detected web servers bind to `0.0.0.0` by default. The panel
+shows local service links with the Mac's current LAN IP instead of the bind
+address. Set `SERVER_MANAGER_LAN_IP` only when automatic LAN IP detection picks
+the wrong interface. Use this only on a trusted network.
 
 On first run, the launcher creates a local `servers.json` from
 `servers.example.json`. `servers.json` is intentionally ignored by Git so your
@@ -35,13 +40,13 @@ machine-specific paths, commands, ports, and service labels stay private.
 ./server-manager web --port 8765
 ```
 
-To allow access from another device on the same trusted LAN:
+To choose the bind address explicitly:
 
 ```bash
 ./server-manager web --host 0.0.0.0 --port 8765
 ```
 
-Then open the machine's LAN IP on port `8765`.
+Use `--host 127.0.0.1` instead when the panel must remain local-only.
 
 ## Web Panel
 
@@ -50,7 +55,9 @@ The web panel can:
 - Add, edit, enable, disable, delete, start, stop, restart, and check services.
 - Show service state, pid, port, URL, recent events, and logs.
 - Tail logs from each service folder.
-- View and edit the macOS repeating restart schedule through `pmset`.
+- View and edit fixed-weekday or every-N-days macOS restart schedules. Interval
+  schedules use `pmset` for the next restart and a local LaunchAgent to advance
+  the date after login.
 
 Service logs are written to:
 
@@ -104,6 +111,10 @@ Optional fields:
 - `url`
 - `startWaitSeconds`
 
+Set `startWaitSeconds` higher than the service's real cold-start time. Services
+that initialize embedded tools, such as BiliLive, may need about 180 seconds;
+the manager waits for `primaryPort` before reporting the start as successful.
+
 For `system` launchd jobs and `pmset repeat`, macOS may require admin
 permission. Configure sudoers narrowly if you want the web panel to control
 those without interactive password prompts.
@@ -116,16 +127,20 @@ Install the background supervisor at login:
 ./server-manager install-launchd
 ```
 
+Enabled process services start when the supervisor loads at login. The
+supervisor also checks them at its configured interval and restarts stopped or
+unhealthy services.
+
 Install the web panel at login:
 
 ```bash
-./server-manager install-web-launchd --host 127.0.0.1 --port 8765
+./server-manager install-web-launchd --host 0.0.0.0 --port 8765
 ```
 
-For LAN access at login:
+For local-only access at login:
 
 ```bash
-./server-manager install-web-launchd --host 0.0.0.0 --port 8765
+./server-manager install-web-launchd --host 127.0.0.1 --port 8765
 ```
 
 Check or remove launchd jobs:
@@ -192,8 +207,12 @@ Example process service:
       "cwd": "/absolute/path/to/project",
       "command": ["python3", "-m", "http.server", "8080"],
       "port": 8080,
-      "url": "http://127.0.0.1:8080"
+      "url": "http://192.168.0.10:8080"
     }
   ]
 }
 ```
+
+For a service that should be opened by other devices on the same network, set
+`url` to the Mac's LAN address, and make sure the service listens on more than
+`127.0.0.1`.
